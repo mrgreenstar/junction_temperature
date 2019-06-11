@@ -27,6 +27,6 @@ junction_temperature_device {
 Usage
 -----
 
-To check FPGA`s junction temperature you need:  
+To check FPGA junction temperature you need:  
     1) Find hwmon device in ```/sys/class/hwmon``` (required device is named as "junction_temperature_driver")  
     2) Read file ```temp1_input``` to see junction temperature in degree celsius.

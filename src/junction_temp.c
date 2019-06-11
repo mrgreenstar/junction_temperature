@@ -100,6 +100,7 @@ static int hwmon_read(struct device          *dev,
         return 0;
 
     default:
+        of_node_put(dev_node);
         return -EOPNOTSUPP;
     }
 
