@@ -1,6 +1,8 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/of.h>
+#include <linux/slab.h>
+#include <linux/delay.h> 
 #include <linux/random.h>
 #include <linux/regmap.h>
 #include <linux/hwmon.h>
@@ -13,6 +15,13 @@
 
 #define DRIVER_NAME "junction_temperature_driver"
 #define FPGA_FEATURE_ECP5_TEMP_MON 37
+
+struct fpga_attrs {
+    struct device_node *dev_node;
+    struct grif_fpga *fpga;
+    struct regmap *dev_regmap;
+    struct fpga_feature *hwmon_feature;
+};
 
 static umode_t hwmon_is_visible(const void             *data,
                                 enum hwmon_sensor_types type,
@@ -36,12 +45,7 @@ static int hwmon_read(struct device          *dev,
                       long                   *val)
 {
     unsigned int reg_val;
-    long start_time_us;
-    struct device_node *dev_node;
-    struct grif_fpga *fpga;
-    struct regmap *dev_regmap;
-    struct fpga_feature *hwmon_feature;
-    struct timeval time;
+    struct fpga_attrs* info = dev->driver_data;
     /* Indexes are decimal equivalents. 
     Values are junction temperature in degree celsius.*/
     static const int16_t junction_temps[] = {
@@ -51,68 +55,27 @@ static int hwmon_read(struct device          *dev,
         100, 101, 102, 103, 104, 105, 106, 107, 108, 116, 120, 124, 128, 132
     };
 
-    dev_node = of_find_node_by_name(NULL, "junction_temperature_device");
-    if (!dev_node) {
-        pr_err("Cannot get device node from tree\n");
-        goto err_no_node;
-    }
-
-    fpga = get_grif_fpga(dev_node);
-    if (!fpga) {
-        pr_err("Cannot get grif_fpga\n");
-        goto err_fpga;
-    }
-
-    hwmon_feature = grif_fpga_get_feature(fpga, FPGA_FEATURE_ECP5_TEMP_MON);
-    if (!hwmon_feature) {
-        pr_err("Cannot get feature\n");
-        goto err_no_feature;
-    }
-
-    dev_regmap = dev_get_regmap(fpga->dev, NULL);
-    if (!dev_regmap) {
-        pr_err("Cannot get regmap\n");
-        goto err_regmap;
-    }
-
     switch (attr) {
     case hwmon_temp_input:
         /* Mask and val are 0x1 to update first bit */
-        regmap_update_bits(dev_regmap, (hwmon_feature->cr_base)*2, 0x1, 0x1);
+        regmap_update_bits(info->dev_regmap, (info->hwmon_feature->cr_base)*2, 0x1, 0x1);
         /* Wait 70 useconds before get result */
-        do_gettimeofday(&time);
-        start_time_us = time.tv_usec;
-        while (time.tv_usec < start_time_us + 70) {
-            do_gettimeofday(&time);
-        }
+        udelay(70);
         /* Get junction temp from ECP5_TEMP_MON_TEMP_SR */
-        regmap_read(dev_regmap, (hwmon_feature->sr_base + 1)*2, &reg_val);
+        regmap_read(info->dev_regmap, (info->hwmon_feature->sr_base + 1)*2, &reg_val);
         /* Checking 7 bit */
         if ((reg_val >> 7) & 1) {
             *val = junction_temps[reg_val & 0x3f];
-            regmap_update_bits(dev_regmap, (hwmon_feature->cr_base)*2, 0x1, 0x0);
+            regmap_update_bits(info->dev_regmap, (info->hwmon_feature->cr_base)*2, 0x1, 0x0);
         }
         else {
             return -EAGAIN;
         }
-
-        of_node_put(dev_node);
         return 0;
 
     default:
-        of_node_put(dev_node);
         return -EOPNOTSUPP;
     }
-
-    err_no_feature:
-    err_no_node:
-        return -1;
-    err_fpga:
-        of_node_put(dev_node);
-        return -ENODEV;
-    err_regmap:
-        of_node_put(dev_node);
-        return -1;
 }
 
 static const u32 temp_chip_config[] = {
@@ -155,15 +118,66 @@ int junction_temp_probe(struct platform_device *p_device)
 {
     struct device *dev = &p_device->dev;
     struct device *hwmon_dev;
+    struct fpga_attrs *info;
     
     hwmon_dev = devm_hwmon_device_register_with_info(
         dev, "junction_temperature_driver", NULL, &driver_hwmon_info, NULL
     );
     if (IS_ERR(hwmon_dev)) {
-        dev_err(hwmon_dev, "Probe error\n");
-        return PTR_ERR(hwmon_dev);
+        goto err_probe;
     }
+
+    info = kzalloc(sizeof(struct fpga_attrs), GFP_KERNEL);
+    info->dev_node = of_find_node_by_name(NULL, "junction_temperature_device");
+    if (!info->dev_node) {
+        pr_err("Cannot get device node from tree\n");
+        goto err_no_node;
+    }
+
+    info->fpga = get_grif_fpga(info->dev_node);
+    if (!info->fpga) {
+        pr_err("Cannot get grif_fpga\n");
+        goto err_fpga;
+    }
+
+    info->hwmon_feature = grif_fpga_get_feature(info->fpga, FPGA_FEATURE_ECP5_TEMP_MON);
+    if (!info->hwmon_feature) {
+        pr_err("Cannot get feature\n");
+        goto err_no_feature;
+    }
+
+    info->dev_regmap = dev_get_regmap(info->fpga->dev, NULL);
+    if (!info->dev_regmap) {
+        pr_err("Cannot get regmap\n");
+        goto err_regmap;
+    }
+
+    dev_set_drvdata(hwmon_dev, info);
+    dev_set_drvdata(&(p_device->dev), hwmon_dev);
     printk(KERN_INFO "Junction temperature monitor is started\n");
+    return 0;
+
+
+err_probe:
+    dev_err(hwmon_dev, "Probe error\n");
+    return PTR_ERR(hwmon_dev);
+err_no_feature:
+err_no_node:
+    return -1;
+err_fpga:
+    of_node_put(info->dev_node);
+    return -ENODEV;
+err_regmap:
+    of_node_put(info->dev_node);
+    return -1;
+}
+
+int junction_temp_remove(struct platform_device *p_device)
+{
+    struct device *hwmon_dev = dev_get_drvdata(&(p_device->dev));
+    struct fpga_attrs *info = dev_get_drvdata(hwmon_dev);
+    of_node_put(info->dev_node);
+    kfree(info);
     return 0;
 }
 
@@ -180,6 +194,7 @@ static struct platform_driver junction_temp_driver = {
         .of_match_table = juction_of_match_table,
     },
     .probe = junction_temp_probe,
+    .remove = junction_temp_remove,
 };
 module_platform_driver(junction_temp_driver);
 
